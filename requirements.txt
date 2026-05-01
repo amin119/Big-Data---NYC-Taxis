@@ -1,0 +1,22 @@
+# Data processing
+pandas==2.2.0
+pyarrow==14.0.2
+numpy==1.26.4
+
+# Kafka
+kafka-python==2.0.2
+
+# Cassandra
+cassandra-driver==3.29.0
+
+# HTTP / Weather API
+requests==2.31.0
+
+# Cloudflare R2 (S3-compatible via boto3)
+boto3==1.34.0
+
+# PySpark (must match the spark-submit version used)
+pyspark==3.5.0
+
+# Utilities
+python-dotenv==1.0.1

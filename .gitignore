@@ -1,0 +1,65 @@
+# ── Secrets & environment ──────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Virtual environments ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Jupyter ─────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Spark ───────────────────────────────────────────────────────────────────────
+spark-warehouse/
+derby.log
+metastore_db/
+checkpoints/
+
+# ── Data files ──────────────────────────────────────────────────────────────────
+data/
+*.parquet
+*.csv
+*.json
+*.avro
+*.orc
+
+# ── Logs ────────────────────────────────────────────────────────────────────────
+*.log
+logs/
+airflow/logs/
+
+# ── Docker local volumes ─────────────────────────────────────────────────────────
+cassandra/data/
+grafana/data/
+postgres/data/
+
+# ── IDE ─────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+
+# ── OS ──────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
