@@ -1,0 +1,14 @@
+============================================================
+  NYC Yellow Taxi — Cloudflare R2 Data Lake Summary
+============================================================
+  Bucket           : chabbah
+  Period           : 2022 → 2026
+  Downloaded       : 0 months
+  Already on R2    : 51 months (skipped)
+  Not published yet: 0 months
+  Failed           : 1 months
+  Total rows       : 0
+  Total size (raw) : 0 MB  (~0.0 GB)
+  Raw zone         : r2://chabbah/raw/trips/year=YYYY/month=MM/
+  Processed zone   : r2://chabbah/processed/trips_clean/year=YYYY/month=MM/
+  Weather zone     : r2://chabbah/raw/weather/year=YYYY/month=MM/

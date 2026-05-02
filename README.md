@@ -11,8 +11,8 @@ Ingests NYC Yellow Taxi trips (2022 → today) and live weather data, processes 
 |-------|------|--------|
 | 0 | Infrastructure — Docker Compose (6 services) | ✅ Done |
 | 1 | Data Lake — TLC trips + weather → Cloudflare R2 | ✅ Done |
-| 2 | Streaming Ingestion — Kafka producers | 🔜 Next |
-| 3 | Stream Processing — Spark Structured Streaming | 🔜 Planned |
+| 2 | Streaming Ingestion — Kafka producers | ✅ Done |
+| 3 | Stream Processing — Spark Structured Streaming | ✅ Done |
 | 4 | Real-time Dashboards — Grafana live | 🔜 Planned |
 | 5 | Batch Processing — Airflow + Spark + MLlib | 🔜 Planned |
 | 6 | Batch Dashboards — Grafana historical | 🔜 Planned |
@@ -157,19 +157,21 @@ All services share the `taxi-net` bridge network.
 ```
 Projet Big data/
 ├── docker-compose.yml              ← 6-service stack
-├── .env                            ← R2 credentials + config (never commit)
+├── .env                            ← R2 credentials + config
 ├── .env.example                    ← Template — copy to .env and fill in secrets
 ├── requirements.txt                ← Python dependencies
 ├── scripts/
-│   └── prepare_data.py             ← ✅ Phase 1: R2 data lake ingestion
-│   # producer.py                   ← 🔜 Phase 2: Kafka trips + weather producers
-│   # consumer_verify.py            ← 🔜 Phase 2: Consumer smoke test
+│   ├── prepare_data.py             ← ✅ Phase 1: R2 data lake ingestion
+│   ├── producer.py                 ← ✅ Phase 2: Kafka trips + weather producers
+│   └── consumer_verify.py          ← ✅ Phase 2: Consumer smoke test
 ├── spark/
-│   # streaming_job.py              ← 🔜 Phase 3: Spark Structured Streaming
-│   # batch_job.py                  ← 🔜 Phase 5: Spark batch + MLlib
+│   ├── streaming_job.py            ← ✅ Phase 3: Spark Structured Streaming
+│   └── batch_job.py                ← 🔜 Phase 5: Spark batch + MLlib
+├── cassandra/
+│   └── init.cql                    ← ✅ Phase 3: Keyspace + 3 tables
 ├── airflow/
 │   └── dags/
-│       # taxi_batch_dag.py         ← 🔜 Phase 5: Airflow DAG
+│       └── taxi_batch_dag.py       ← 🔜 Phase 5: Airflow DAG
 └── README.md
 ```
 
@@ -237,27 +239,42 @@ Expected output per month:
 
 Total time: ~20–40 minutes for 2022 → today on a standard connection.
 
-### 5 — Phase 2: Start Kafka Producers *(coming next)*
-
-> `scripts/producer.py` and `scripts/consumer_verify.py` are not yet implemented.
+### 5 — Phase 2: Start Kafka Producers
 
 ```bash
-# Terminal 1 — trips producer (replays R2 data at ~20 trips/s)
+# Terminal 1 — keep running; producer loops through all 51 R2 month files continuously
 python scripts/producer.py
 
-# Terminal 2 — verify messages are flowing
+# Terminal 2 — smoke test: prints 30 messages then exits with a summary
 python scripts/consumer_verify.py
 ```
 
-### 6 — Phase 3: Launch Spark Streaming *(planned)*
+### 6 — Phase 3: Launch Spark Structured Streaming
 
-> `spark/streaming_job.py` is not yet implemented.
+Requires the producer (Terminal 1) to already be running. First run downloads ~200 MB of Spark JARs into `~/.ivy2` — subsequent runs are instant.
 
-```bash
-spark-submit \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,\
-com.datastax.spark:spark-cassandra-connector_2.12:3.4.1 \
-  spark/streaming_job.py
+```powershell
+# Terminal 3 — keep running alongside the producer
+python spark/streaming_job.py
+```
+
+The job auto-creates the Cassandra keyspace and tables on first run. After ~35 seconds you should see:
+```
+[weather epoch 1] clear_mild | 10.8°C | rain=False cold=False
+[trips  epoch 2] 23 zones | weather: clear_mild ×1.0 | window: 2026-05-02 ...
+```
+
+**Verify the streaming is working** (Terminal 4, after at least one batch printed):
+
+```powershell
+# Check trip window stats were written to Cassandra
+docker exec cassandra cqlsh -e "SELECT zone_id, window_start, trip_count, predicted_demand, weather_label FROM taxi_streaming.trip_stats_by_window LIMIT 10;"
+
+# Check live weather snapshots
+docker exec cassandra cqlsh -e "SELECT recorded_at, weather_label, temperature_c, is_raining FROM taxi_streaming.weather_snapshots WHERE source='open-meteo' LIMIT 5;"
+
+# Run twice 30 s apart — count must increase each time
+docker exec cassandra cqlsh -e "SELECT COUNT(*) FROM taxi_streaming.trip_stats_by_window;"
 ```
 
 ### 7 — Phase 4: Open Grafana Dashboards *(planned)*
@@ -293,30 +310,103 @@ com.datastax.spark:spark-cassandra-connector_2.12:3.4.1 \
 
 ---
 
+## Phase 3 — How the Streaming Works
+
+### The Big Picture
+
+Once the Kafka producer is running, `streaming_job.py` opens **two parallel Spark streams** that read from Kafka continuously. Every 30 seconds, Spark wakes up, processes everything that arrived since the last wake-up, and writes results to Cassandra. Grafana reads from Cassandra to update the live dashboard.
+
+```
+Kafka: taxi-trips  ──► Stream A (trips)   ──► trip_stats_by_window  ──► Grafana
+Kafka: taxi-weather ──► Stream B (weather) ──► weather_snapshots     ──► Grafana
+                              │
+                        shared weather state
+                              │
+                    demand prediction applied
+                    inside Stream A writes
+```
+
+### Stream A — Trips (trigger every 30 s)
+
+1. **Read**: Spark reads every JSON message that arrived on the `taxi-trips` topic in the last 30 seconds. Each message is one taxi trip with fields like `PULocationID`, `fare_amount`, `trip_distance`, `ingested_at`, and pre-computed flags like `is_fare_anomaly`.
+
+2. **Parse + timestamp**: The JSON string is parsed against a fixed schema. `ingested_at` is cast to a proper timestamp — this becomes the **event time** used for windowing.
+
+3. **5-minute tumbling window**: Trips are grouped by `(pickup zone, 5-minute window)`. For each group Spark computes:
+   - `trip_count` — how many trips departed this zone in this 5-min slot
+   - `avg_fare` — average base fare
+   - `avg_distance` — average trip distance
+   - `anomaly_count` — trips with a fare outside \$0–200 or distance ≤ 0 or > 100 mi
+
+4. **10-minute watermark**: Spark waits up to 10 minutes for late-arriving messages before finalising a window. This handles network jitter without holding state forever.
+
+5. **Weather multiplier** (applied inside `foreachBatch`): At write time, Spark reads the latest weather from the shared in-memory state and computes:
+
+   | Condition | Multiplier |
+   |-----------|-----------|
+   | Rain + Cold (≤ 5 °C) | × 1.4 |
+   | Rain only | × 1.3 |
+   | Cold only | × 1.1 |
+   | Clear + Mild | × 1.0 |
+
+   `predicted_demand = trip_count × multiplier` gives an estimate of how many taxis each zone would need in the *next* 5-minute window under current weather.
+
+6. **Write to Cassandra**: Each row written to `trip_stats_by_window` has: `zone_id`, `window_start`, `trip_count`, `avg_fare`, `avg_distance`, `anomaly_count`, `weather_label`, `multiplier`, `predicted_demand`.
+
+### Stream B — Weather (trigger every 10 s)
+
+1. **Read**: Spark reads messages from `taxi-weather`. The producer sends one weather snapshot every 500 trip rows (~25 seconds), so this stream is sparse but timely.
+
+2. **Update shared state**: The latest row from each micro-batch updates a thread-safe Python dict (`_weather`). Stream A reads this dict inside its `foreachBatch`, so the demand multiplier always reflects the most recent weather without any stream-stream join complexity.
+
+3. **Write to Cassandra**: Each weather message is also persisted to `weather_snapshots` (partitioned by `source = 'open-meteo'`, clustered by `recorded_at DESC`). Grafana queries `SELECT * FROM weather_snapshots WHERE source = 'open-meteo' LIMIT 1` to display current conditions.
+
+### Why Not a Stream-Stream Join?
+
+Spark supports joining two streams, but it requires matching events by a key within a time range. Weather messages arrive very infrequently (1 per 500 trips) — a stream-stream join would either miss most weather messages or hold a huge amount of state waiting for a match. The shared in-memory dict is simpler, correct for this use case, and uses zero extra memory beyond one weather object.
+
+### Why Rule-Based Demand Prediction (Not ML)?
+
+Running a Spark MLlib model inside a 30-second micro-batch on a laptop would trigger Out-Of-Memory errors because the model must be loaded and applied on the driver within the batch window. The rule-based multiplier is backed by real NYC TLC studies (rain increases taxi demand 20–40%) and runs in microseconds. The ML model is trained in the batch path (Phase 5) where memory is not a constraint.
+
+---
+
 ## Cassandra Schema
 
-```cql
-CREATE KEYSPACE IF NOT EXISTS taxi_streaming
-  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+Full schema in [cassandra/init.cql](cassandra/init.cql). Applied automatically by `streaming_job.py` on first run, or manually:
 
--- Streaming results (5-min windows)
-CREATE TABLE taxi_streaming.trip_stats_by_window (
-    window_start  timestamp,
-    zone_id       int,
-    trip_count    bigint,
-    avg_fare      double,
-    avg_distance  double,
-    weather_label text,
+```bash
+docker exec -i cassandra cqlsh < cassandra/init.cql
+```
+
+| Table | Written by | Purpose |
+|-------|-----------|---------|
+| `trip_stats_by_window` | Spark Streaming (30 s) | 5-min window counts, fares, predicted demand |
+| `weather_snapshots` | Spark Streaming (10 s) | Current NYC conditions for Grafana |
+| `daily_stats` | Spark Batch (Phase 5) | Daily aggregates per zone |
+
+```cql
+-- Streaming: 5-min window per zone, newest first
+CREATE TABLE trip_stats_by_window (
+    zone_id int, window_start timestamp,
+    trip_count bigint, avg_fare double, avg_distance double,
+    anomaly_count bigint, weather_label text,
+    multiplier double, predicted_demand int,
     PRIMARY KEY ((zone_id), window_start)
 ) WITH CLUSTERING ORDER BY (window_start DESC);
 
--- Batch results (daily aggregates)
-CREATE TABLE taxi_streaming.daily_stats (
-    date          date,
-    zone_id       int,
-    trip_count    bigint,
-    total_revenue double,
-    avg_tip       double,
+-- Weather: latest snapshot queryable with LIMIT 1
+CREATE TABLE weather_snapshots (
+    source text, recorded_at timestamp,
+    temperature_c double, precipitation double, windspeed double,
+    weathercode int, is_raining boolean, is_cold boolean, weather_label text,
+    PRIMARY KEY (source, recorded_at)
+) WITH CLUSTERING ORDER BY (recorded_at DESC);
+
+-- Batch: daily aggregates per zone (Phase 5)
+CREATE TABLE daily_stats (
+    zone_id int, date date,
+    trip_count bigint, total_revenue double, avg_tip double,
     PRIMARY KEY ((zone_id), date)
 ) WITH CLUSTERING ORDER BY (date DESC);
 ```
@@ -390,8 +480,8 @@ Remove-Item -Recurse -Force checkpoints/
 |-----------|-------------|--------|
 | Phase 0 | `docker compose ps` — all 6 services running/healthy | ✅ |
 | Phase 1 | R2 bucket has `raw/trips/year=2022/` through current month | ✅ |
-| Phase 2 | `consumer_verify.py` prints trip records continuously | 🔜 |
-| Phase 3 | Cassandra `trip_stats_by_window` accumulates rows every 30 s | 🔜 |
+| Phase 2 | `consumer_verify.py` prints trip records continuously | ✅ |
+| Phase 3 | Cassandra `trip_stats_by_window` accumulates rows every 30 s | ✅ |
 | Phase 4 | Grafana live dashboard at `localhost:3001` shows rolling demand chart | 🔜 |
 | Phase 5 | Airflow DAG `taxi_batch_daily` completes all tasks green | 🔜 |
 | Phase 6 | Grafana batch dashboard shows historical zone heatmap | 🔜 |
