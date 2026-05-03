@@ -14,7 +14,7 @@ Ingests NYC Yellow Taxi trips (2022 → today) and live weather data, processes 
 | 2 | Streaming Ingestion — Kafka producers | ✅ Done |
 | 3 | Stream Processing — Spark Structured Streaming | ✅ Done |
 | 4 | Real-time Dashboards — Grafana live | 🔜 Planned |
-| 5 | Batch Processing — Airflow + Spark + MLlib | 🔜 Planned |
+| 5 | Batch Processing — Airflow + Spark + MLlib | ✅ Done |
 | 6 | Batch Dashboards — Grafana historical | 🔜 Planned |
 
 ---
@@ -166,12 +166,12 @@ Projet Big data/
 │   └── consumer_verify.py          ← ✅ Phase 2: Consumer smoke test
 ├── spark/
 │   ├── streaming_job.py            ← ✅ Phase 3: Spark Structured Streaming
-│   └── batch_job.py                ← 🔜 Phase 5: Spark batch + MLlib
+│   └── batch_job.py                ← ✅ Phase 5: Spark batch + MLlib
 ├── cassandra/
 │   └── init.cql                    ← ✅ Phase 3: Keyspace + 3 tables
 ├── airflow/
 │   └── dags/
-│       └── taxi_batch_dag.py       ← 🔜 Phase 5: Airflow DAG
+│       └── taxi_batch_dag.py       ← ✅ Phase 5: Airflow DAG
 └── README.md
 ```
 
@@ -284,14 +284,31 @@ docker exec cassandra cqlsh -e "SELECT COUNT(*) FROM taxi_streaming.trip_stats_b
 - **Live Dashboard**: rolling 5-minute demand and weather metrics
 - **Batch Dashboard**: historical trends, zone heatmaps, model accuracy
 
-### 8 — Phase 5: Trigger Batch Pipeline *(planned)*
+### 8 — Phase 5: Run the Batch Job
 
-> `airflow/dags/taxi_batch_dag.py` and `spark/batch_job.py` are not yet implemented.
+**Option A — run locally (faster to test):**
+```powershell
+python spark/batch_job.py
+```
+Processes all 12 months of `BATCH_YEAR` (default 2024) from R2, writes results to Cassandra and R2, then trains the MLlib model. Expected output:
+```
+[2024-01]  2,964,624 trips | 744 weather rows → revenue 232 zones | density 18,432 combos | ML 5000 rows
+...
+Model — RMSE: 6.4 min | R²: 0.71
+Results in R2 : r2://chabbah/batch_results/
+```
 
-```bash
-# Airflow UI: http://localhost:8888
-# Login: admin / admin
-# Enable the "taxi_batch_daily" DAG, then trigger manually
+**Option B — via Airflow (scheduled, runs daily at 02:00 UTC):**
+
+First restart Airflow so it installs the new pip packages:
+```powershell
+docker compose restart airflow
+```
+Then open `http://localhost:8888` (admin / admin), find `taxi_batch_daily`, toggle it **ON**, and click the ▶ play button to trigger a manual run.
+
+**Verify results in Cassandra:**
+```powershell
+docker exec cassandra cqlsh -e "SELECT zone_id, date, trip_count, total_revenue FROM taxi_streaming.daily_stats LIMIT 10;"
 ```
 
 ---
@@ -368,6 +385,63 @@ Spark supports joining two streams, but it requires matching events by a key wit
 ### Why Rule-Based Demand Prediction (Not ML)?
 
 Running a Spark MLlib model inside a 30-second micro-batch on a laptop would trigger Out-Of-Memory errors because the model must be loaded and applied on the driver within the batch window. The rule-based multiplier is backed by real NYC TLC studies (rain increases taxi demand 20–40%) and runs in microseconds. The ML model is trained in the batch path (Phase 5) where memory is not a constraint.
+
+---
+
+## Phase 5 — How the Batch Job Works
+
+### The Big Picture
+
+The batch job runs once a day (via Airflow at 02:00 UTC). It reads the full year of trip + weather data from R2, computes three outputs, and stores them for the Grafana batch dashboard.
+
+```
+Cloudflare R2
+  processed/trips_clean/year=2024/month=01/ ──┐
+  processed/trips_clean/year=2024/month=02/ ──┤
+  ...                                          ├──► batch_job.py ──► Cassandra daily_stats
+  raw/weather/year=2024/month=01/           ──┤                 ──► R2 batch_results/revenue/
+  raw/weather/year=2024/month=02/           ──┘                 ──► R2 batch_results/density/
+                                                                 ──► models/trip_duration_model/
+```
+
+### Step-by-step logic
+
+**Step 1 — Load one month at a time**  
+Instead of trying to load 4 GB at once (which would crash the machine), the job loops through months 01–12. For each month it downloads the trip Parquet file and the weather Parquet file from R2 using boto3 — the same boto3 approach that already works in Phase 1. After processing each month the raw data is discarded, keeping memory usage low.
+
+**Step 2 — Join trips with weather**  
+Each trip has a `tpep_pickup_datetime`. The weather data is hourly (one row per hour). The join key is `pickup_hour = pickup_datetime rounded down to the nearest hour`. For example, a trip at 14:37 joins the weather row for 14:00. This gives every trip a weather context: temperature, rain status, weather label.
+
+**Step 3 — Revenue per zone/month**  
+For each (pickup zone, month) pair, the job computes:
+- `trip_count` — total trips that started in this zone this month
+- `total_revenue` — sum of all `total_amount` values
+- `avg_fare` — average base fare
+- `avg_tip` — average tip
+
+Results go to the Cassandra `daily_stats` table so Grafana can draw a revenue-by-zone bar chart.
+
+**Step 4 — Traffic density (zone × hour × weather)**  
+Groups trips by (zone, hour of day, day of week, is_raining). Counts how many trips happened in each combination. Then classifies each as **Low / Medium / High** based on the 33rd and 66th percentile of trip counts across all groups. This answers questions like *"Zone 161 on Monday at 8am when raining = HIGH density"*. Written to R2 as a Parquet file for Grafana to load.
+
+**Step 5 — MLlib trip duration model**  
+Samples 5 000 rows per month (60 000 total for 2024), assembles them into a Spark DataFrame, and trains a **Linear Regression** to predict `trip_duration_min`.
+
+Features used:
+| Feature | Why |
+|---------|-----|
+| `trip_distance` | Main driver of duration |
+| `hour_of_day` | Traffic varies by hour |
+| `day_of_week` | Rush hours differ Mon vs Sat |
+| `PULocationID` | Zone-level traffic patterns |
+| `passenger_count` | Minor effect on boarding time |
+| `is_raining` | Rain slows traffic 10–20% |
+
+The model coefficients show which features matter most. A realistic result is RMSE ≈ 6–8 min and R² ≈ 0.65–0.75. The model is saved locally to `models/trip_duration_model/`.
+
+### Why pandas for aggregations, Spark only for ML?
+
+Reading 12 months one at a time in pandas and aggregating is simpler and faster on a laptop than configuring Spark to read from R2 via S3A (which requires matching Hadoop JAR versions). The aggregations are straightforward GROUP BY operations — no need for Spark's distributed power here. Spark MLlib is used where it actually adds value: distributed model training with a proper train/test split and built-in evaluation metrics.
 
 ---
 
@@ -483,7 +557,7 @@ Remove-Item -Recurse -Force checkpoints/
 | Phase 2 | `consumer_verify.py` prints trip records continuously | ✅ |
 | Phase 3 | Cassandra `trip_stats_by_window` accumulates rows every 30 s | ✅ |
 | Phase 4 | Grafana live dashboard at `localhost:3001` shows rolling demand chart | 🔜 |
-| Phase 5 | Airflow DAG `taxi_batch_daily` completes all tasks green | 🔜 |
+| Phase 5 | Airflow DAG `taxi_batch_daily` completes all tasks green | ✅ |
 | Phase 6 | Grafana batch dashboard shows historical zone heatmap | 🔜 |
 
 ---
