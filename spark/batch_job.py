@@ -86,8 +86,14 @@ def _load_r2_month(prefix: str, year: int, month: int) -> pd.DataFrame:
         for obj in page.get("Contents", []):
             if not obj["Key"].endswith(".parquet"):
                 continue
-            buf = BytesIO()
-            client.download_fileobj(R2_BUCKET, obj["Key"], buf)
+            for attempt in range(3):
+                buf = BytesIO()
+                try:
+                    client.download_fileobj(R2_BUCKET, obj["Key"], buf)
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
             buf.seek(0)
             dfs.append(pd.read_parquet(buf))
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
