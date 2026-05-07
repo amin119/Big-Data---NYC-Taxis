@@ -21,13 +21,14 @@ CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "taxi_streaming")
 PORT               = int(os.getenv("ZONE_API_PORT",  "5001"))
 
 
-def fetch_zones() -> list:
+def _query_zone_map_stats(snapshot: str) -> list:
     from cassandra.cluster import Cluster
     cluster = Cluster([CASSANDRA_HOST], port=CASSANDRA_PORT)
     session = cluster.connect(CASSANDRA_KEYSPACE)
     rows = session.execute(
         "SELECT zone_id, lat, lon, zone_name, borough, trip_count, predicted_demand "
-        "FROM zone_map_stats WHERE snapshot='current'"
+        "FROM zone_map_stats WHERE snapshot=%s",
+        (snapshot,),
     )
     data = [
         {
@@ -45,29 +46,68 @@ def fetch_zones() -> list:
     return data
 
 
+def fetch_zones() -> list:
+    return _query_zone_map_stats("current")
+
+
+def fetch_zones_batch(year: int) -> list:
+    return _query_zone_map_stats(f"batch-{year}")
+
+
+def _parse_qs(path: str) -> dict:
+    """Extract query string params from a path like /zones/batch?year=2022."""
+    if "?" not in path:
+        return {}
+    qs = path.split("?", 1)[1]
+    params = {}
+    for part in qs.split("&"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            params[k] = v
+    return params
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/zones"):
+        path = self.path.split("?")[0]
+        params = _parse_qs(self.path)
+
+        if path == "/zones/batch":
+            try:
+                year = int(params.get("year", 2022))
+                data = fetch_zones_batch(year)
+                self._send_json(data)
+                print(f"  GET /zones/batch?year={year} → {len(data)} zones served")
+            except Exception as exc:
+                self._send_error(exc)
+                print(f"  GET /zones/batch ERROR: {exc}")
+        elif path == "/zones":
             try:
                 data = fetch_zones()
-                body = json.dumps(data).encode()
-                self.send_response(200)
-                self.send_header("Content-Type",                 "application/json")
-                self.send_header("Content-Length",               str(len(body)))
-                self.send_header("Access-Control-Allow-Origin",  "*")
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json(data)
                 print(f"  GET /zones → {len(data)} zones served")
             except Exception as exc:
-                body = json.dumps({"error": str(exc)}).encode()
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_error(exc)
                 print(f"  GET /zones ERROR: {exc}")
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _send_json(self, data):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type",                "application/json")
+        self.send_header("Content-Length",              str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error(self, exc):
+        body = json.dumps({"error": str(exc)}).encode()
+        self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, *_):
         pass
@@ -77,6 +117,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"  NYC Taxi — Zone API")
     print(f"  Cassandra : {CASSANDRA_HOST}:{CASSANDRA_PORT}/{CASSANDRA_KEYSPACE}")
-    print(f"  Endpoint  : http://localhost:{PORT}/zones")
+    print(f"  Live      : http://localhost:{PORT}/zones")
+    print(f"  Batch     : http://localhost:{PORT}/zones/batch?year=2022")
     print("=" * 50)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

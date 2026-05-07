@@ -39,6 +39,7 @@ from pyspark.ml.regression import LinearRegression
 from pyspark.ml.evaluation import RegressionEvaluator
 
 load_dotenv()
+pd.set_option("future.no_silent_downcasting", True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 R2_ENDPOINT          = os.getenv("R2_ENDPOINT")
@@ -111,7 +112,8 @@ def _upload_parquet(df: pd.DataFrame, key: str):
 
 def _cassandra_session():
     from cassandra.cluster import Cluster
-    cluster = Cluster([CASSANDRA_HOST], port=CASSANDRA_PORT)
+    # protocol_version=4 avoids CRC header mismatches introduced in v5
+    cluster = Cluster([CASSANDRA_HOST], port=CASSANDRA_PORT, protocol_version=4)
     session = cluster.connect(CASSANDRA_KEYSPACE)
     return cluster, session
 
@@ -132,6 +134,55 @@ def _write_revenue_to_cassandra(df: pd.DataFrame):
             float(row["avg_tip"]),
         ))
     cluster.shutdown()
+
+
+def _write_zone_heatmap_to_cassandra(revenue_df: pd.DataFrame, year: int):
+    """Aggregate trip counts per zone for the full year and write to zone_map_stats."""
+    import json
+
+    centroids_file = "zone_centroids.json"
+    if not os.path.exists(centroids_file):
+        print(f"  WARNING: {centroids_file} not found — skipping batch heatmap write")
+        return
+
+    with open(centroids_file) as f:
+        centroids = {int(k): v for k, v in json.load(f).items()}
+
+    yearly = (
+        revenue_df.groupby("zone_id")
+        .agg(trip_count=("trip_count", "sum"))
+        .reset_index()
+    )
+
+    cluster, session = _cassandra_session()
+    stmt = session.prepare("""
+        INSERT INTO zone_map_stats
+            (snapshot, zone_id, lat, lon, zone_name, borough, trip_count, predicted_demand, weather_label, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """)
+    snapshot = f"batch-{year}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    written = 0
+    for _, row in yearly.iterrows():
+        zid = int(row["zone_id"])
+        if zid not in centroids:
+            continue
+        c = centroids[zid]
+        session.execute(stmt, (
+            snapshot,
+            zid,
+            float(c["lat"]),
+            float(c["lon"]),
+            c["zone_name"],
+            c["borough"],
+            int(row["trip_count"]),
+            0,
+            "batch",
+            now,
+        ))
+        written += 1
+    cluster.shutdown()
+    print(f"  Heatmap → Cassandra snapshot='{snapshot}' | {written} zones ✓")
 
 
 # ── Step 1 & 2 — Load and join trips + weather for one month ──────────────────
@@ -179,8 +230,8 @@ def _process_month(month_num: int):
         merged["weather_label"]   = "clear_mild"
         merged["temperature_2m"]  = 15.0
 
-    merged["is_raining"] = merged["is_raining"].fillna(False).infer_objects(copy=False).astype(bool)
-    merged["is_cold"]    = merged["is_cold"].fillna(False).infer_objects(copy=False).astype(bool)
+    merged["is_raining"] = merged["is_raining"].fillna(False).astype(bool)
+    merged["is_cold"]    = merged["is_cold"].fillna(False).astype(bool)
     merged["weather_label"] = merged["weather_label"].fillna("clear_mild")
 
     # ── Step 3 — Revenue per zone/month ───────────────────────────────────────
@@ -310,6 +361,10 @@ def main():
         f"{R2_BATCH_RESULTS}/revenue/year={BATCH_YEAR}/revenue.parquet",
     )
     print(f" {len(final_revenue)} rows ✓")
+
+    # ── Write yearly zone heatmap ──────────────────────────────────────────────
+    print("  Writing zone heatmap → Cassandra ...", end="", flush=True)
+    _write_zone_heatmap_to_cassandra(final_revenue, BATCH_YEAR)
 
     # ── Write density ──────────────────────────────────────────────────────────
     print("  Writing density → R2 ...", end="", flush=True)
