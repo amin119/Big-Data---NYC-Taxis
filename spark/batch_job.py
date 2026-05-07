@@ -21,6 +21,8 @@ Configure BATCH_YEAR in .env (default: 2024).
 """
 
 import os
+import gevent.monkey; gevent.monkey.patch_all()  # must be before all other imports for Python 3.12
+
 import sys
 import math
 import shutil
@@ -171,8 +173,8 @@ def _process_month(month_num: int):
         merged["weather_label"]   = "clear_mild"
         merged["temperature_2m"]  = 15.0
 
-    merged["is_raining"] = merged["is_raining"].fillna(False).astype(bool)
-    merged["is_cold"]    = merged["is_cold"].fillna(False).astype(bool)
+    merged["is_raining"] = merged["is_raining"].fillna(False).infer_objects(copy=False).astype(bool)
+    merged["is_cold"]    = merged["is_cold"].fillna(False).infer_objects(copy=False).astype(bool)
     merged["weather_label"] = merged["weather_label"].fillna("clear_mild")
 
     # ── Step 3 — Revenue per zone/month ───────────────────────────────────────

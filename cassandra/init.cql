@@ -48,3 +48,20 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     avg_tip       double,
     PRIMARY KEY ((zone_id), date)
 ) WITH CLUSTERING ORDER BY (date DESC);
+
+-- ── Live zone map: one row per zone, single partition for full-table read ────
+-- Written by load_zone_centroids.py (lat/lon), updated by Spark Streaming (counts).
+-- Grafana Geomap queries: SELECT * FROM zone_map_stats WHERE snapshot='current'
+CREATE TABLE IF NOT EXISTS zone_map_stats (
+    snapshot         text,
+    zone_id          int,
+    lat              double,
+    lon              double,
+    zone_name        text,
+    borough          text,
+    trip_count       bigint,
+    predicted_demand int,
+    weather_label    text,
+    updated_at       timestamp,
+    PRIMARY KEY (snapshot, zone_id)
+);

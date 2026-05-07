@@ -52,6 +52,25 @@ services:
     volumes:
       - cassandra_data:/var/lib/cassandra
 
+  zone-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.zone-api
+    container_name: zone-api
+    networks:
+      - taxi-net
+    ports:
+      - "5001:5001"
+    environment:
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_PORT: 9042
+      CASSANDRA_KEYSPACE: taxi_streaming
+      ZONE_API_PORT: 5001
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    restart: unless-stopped
+
   grafana:
     image: grafana/grafana:10.2.0
     container_name: grafana

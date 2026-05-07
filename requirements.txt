@@ -4,10 +4,11 @@ pyarrow==14.0.2
 numpy==1.26.4
 
 # Kafka
-kafka-python==2.0.2
+kafka-python-ng==2.2.3
 
 # Cassandra
 cassandra-driver==3.29.0
+gevent==24.2.1          # monkey-patches stdlib for cassandra-driver on Python 3.12
 
 # HTTP / Weather API
 requests==2.31.0
@@ -20,3 +21,8 @@ pyspark==3.5.0
 
 # Utilities
 python-dotenv==1.0.1
+setuptools>=68.0.0
+
+# Geo — zone centroid loader only (pyshp pure-Python, pyproj ships bundled PROJ)
+pyshp>=2.3.0
+pyproj>=3.5.0

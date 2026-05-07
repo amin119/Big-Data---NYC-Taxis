@@ -19,7 +19,10 @@ Prerequisites:
 """
 
 import os
+import sys
+import json
 import threading
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
@@ -56,6 +59,23 @@ _weather = {
     "weather_label":  "clear_mild",
 }
 _lock = threading.Lock()
+
+# ── Zone centroids (loaded once at startup from local JSON file) ───────────────
+# zone_id → {"lat": float, "lon": float, "zone_name": str, "borough": str}
+# File is written by scripts/load_zone_centroids.py
+_centroids: dict = {}
+CENTROIDS_FILE = "zone_centroids.json"
+
+
+def load_centroids() -> None:
+    global _centroids
+    if not os.path.exists(CENTROIDS_FILE):
+        print(f"  WARNING: {CENTROIDS_FILE} not found — run scripts/load_zone_centroids.py first")
+        return
+    with open(CENTROIDS_FILE) as f:
+        data = json.load(f)
+    _centroids = {int(k): v for k, v in data.items()}
+    print(f"  Loaded {len(_centroids)} zone centroids from {CENTROIDS_FILE}")
 
 
 def get_weather() -> dict:
@@ -271,13 +291,35 @@ def start_trips_stream(spark):
 
         try:
             cass_write(out, "trip_stats_by_window")
-            n = out.count()
+            rows = out.collect()
+            n = len(rows)
             print(
                 f"  [trips  epoch {epoch_id}] "
                 f"{n} zones | "
                 f"weather: {wlabel} ×{multiplier} | "
-                f"window: {out.agg({'window_start': 'max'}).collect()[0][0]}"
+                f"window: {max(r.window_start for r in rows)}"
             )
+            # Update zone_map_stats for Grafana Geomap (Spark connector, no cassandra-driver)
+            if _centroids:
+                from pyspark.sql import Row
+                now = datetime.now(timezone.utc)
+                map_rows = [
+                    Row(
+                        snapshot="current",
+                        zone_id=int(r.zone_id),
+                        lat=_centroids[r.zone_id]["lat"],
+                        lon=_centroids[r.zone_id]["lon"],
+                        zone_name=_centroids[r.zone_id]["zone_name"],
+                        borough=_centroids[r.zone_id]["borough"],
+                        trip_count=int(r.trip_count),
+                        predicted_demand=int(r.predicted_demand),
+                        weather_label=wlabel,
+                        updated_at=now,
+                    )
+                    for r in rows if r.zone_id in _centroids
+                ]
+                if map_rows:
+                    cass_write(spark.createDataFrame(map_rows), "zone_map_stats")
         except Exception as exc:
             print(f"  [trips] Cassandra write error: {exc}")
 
@@ -306,9 +348,8 @@ def main():
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
-    print("\n  Initialising Cassandra schema ...", end="", flush=True)
-    _init_cassandra_schema()
-    print(" OK")
+    print("  Loading zone centroids ...")
+    load_centroids()
 
     print("  Starting weather stream ...")
     weather_q = start_weather_stream(spark)
@@ -331,8 +372,9 @@ def main():
 def _init_cassandra_schema():
     """Create keyspace and tables using cassandra-driver if they don't exist."""
     try:
+        from cassandra.io.asyncioreactor import AsyncioConnection  # must precede Cluster import
         from cassandra.cluster import Cluster
-        cluster = Cluster([CASSANDRA_HOST], port=int(CASSANDRA_PORT))
+        cluster = Cluster([CASSANDRA_HOST], port=int(CASSANDRA_PORT), connection_class=AsyncioConnection)
         session = cluster.connect()
 
         session.execute(f"""
@@ -380,6 +422,22 @@ def _init_cassandra_schema():
                 avg_tip       double,
                 PRIMARY KEY ((zone_id), date)
             ) WITH CLUSTERING ORDER BY (date DESC)
+        """)
+
+        session.execute("""
+            CREATE TABLE IF NOT EXISTS zone_map_stats (
+                snapshot         text,
+                zone_id          int,
+                lat              double,
+                lon              double,
+                zone_name        text,
+                borough          text,
+                trip_count       bigint,
+                predicted_demand int,
+                weather_label    text,
+                updated_at       timestamp,
+                PRIMARY KEY (snapshot, zone_id)
+            )
         """)
 
         cluster.shutdown()
