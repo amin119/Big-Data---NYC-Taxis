@@ -35,6 +35,7 @@ spark-warehouse/
 derby.log
 metastore_db/
 checkpoints/
+models/
 
 # ── Data files ──────────────────────────────────────────────────────────────────
 data/
