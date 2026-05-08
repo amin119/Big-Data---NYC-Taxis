@@ -31,6 +31,7 @@ import datetime
 import boto3
 import pandas as pd
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
@@ -57,6 +58,7 @@ CASSANDRA_KEYSPACE   = os.getenv("CASSANDRA_KEYSPACE", "taxi_streaming")
 BATCH_YEAR           = int(os.getenv("BATCH_YEAR",     "2024"))
 MODEL_DIR            = "models/trip_duration_model"
 ML_SAMPLE_PER_MONTH  = 5_000   # rows sampled per month for ML training
+MAX_DOWNLOAD_WORKERS = 6       # concurrent month downloads
 
 
 # ── R2 helpers ─────────────────────────────────────────────────────────────────
@@ -77,27 +79,39 @@ def _r2():
     )
 
 
+def _download_key(key: str) -> pd.DataFrame:
+    """Download a single Parquet key from R2 with retries. Each call gets its own client."""
+    client = _r2()
+    for attempt in range(3):
+        buf = BytesIO()
+        try:
+            client.download_fileobj(R2_BUCKET, key, buf)
+            break
+        except Exception:
+            if attempt == 2:
+                raise
+    buf.seek(0)
+    return pd.read_parquet(buf)
+
+
 def _load_r2_month(prefix: str, year: int, month: int) -> pd.DataFrame:
     """Download one month's Parquet file(s) from R2 into a pandas DataFrame."""
     key_prefix = f"{prefix}/year={year}/month={month:02d}/"
     client = _r2()
     paginator = client.get_paginator("list_objects_v2")
-    dfs = []
-    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=key_prefix):
-        for obj in page.get("Contents", []):
-            if not obj["Key"].endswith(".parquet"):
-                continue
-            for attempt in range(3):
-                buf = BytesIO()
-                try:
-                    client.download_fileobj(R2_BUCKET, obj["Key"], buf)
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-            buf.seek(0)
-            dfs.append(pd.read_parquet(buf))
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    keys = [
+        obj["Key"]
+        for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=key_prefix)
+        for obj in page.get("Contents", [])
+        if obj["Key"].endswith(".parquet")
+    ]
+    if not keys:
+        return pd.DataFrame()
+    if len(keys) == 1:
+        return _download_key(keys[0])
+    with ThreadPoolExecutor(max_workers=min(len(keys), 4)) as ex:
+        dfs = list(ex.map(_download_key, keys))
+    return pd.concat(dfs, ignore_index=True)
 
 
 def _upload_parquet(df: pd.DataFrame, key: str):
@@ -192,15 +206,14 @@ def _process_month(month_num: int):
     Returns (revenue_df, density_df, ml_sample_df) for one month.
     All three are plain pandas DataFrames.
     """
-    print(f"\n  [{BATCH_YEAR}-{month_num:02d}]", end="", flush=True)
+    tag = f"[{BATCH_YEAR}-{month_num:02d}]"
 
     trips = _load_r2_month(R2_PROCESSED, BATCH_YEAR, month_num)
     if trips.empty:
-        print(" no trips found — skipping")
+        print(f"  {tag} no trips found — skipping")
         return None, None, None
 
     weather = _load_r2_month(R2_RAW_WEATHER, BATCH_YEAR, month_num)
-    print(f" {len(trips):,} trips | {len(weather):,} weather rows", end="", flush=True)
 
     # ── Parse timestamps & add features ───────────────────────────────────────
     trips["tpep_pickup_datetime"]  = pd.to_datetime(trips["tpep_pickup_datetime"],  errors="coerce")
@@ -265,7 +278,10 @@ def _process_month(month_num: int):
     ].copy()
     ml_sample = ml.sample(min(ML_SAMPLE_PER_MONTH, len(ml)), random_state=42)
 
-    print(f" → revenue {len(revenue)} zones | density {len(density)} combos | ML {len(ml_sample)} rows")
+    print(
+        f"  {tag} {len(trips):,} trips | {len(weather):,} weather rows"
+        f" → revenue {len(revenue)} zones | density {len(density)} combos | ML {len(ml_sample)} rows"
+    )
     return revenue, density, ml_sample
 
 
@@ -341,12 +357,19 @@ def main():
     all_density = []
     all_ml      = []
 
-    for m in range(1, 13):
-        rev, den, ml = _process_month(m)
-        if rev is not None:
-            all_revenue.append(rev)
-            all_density.append(den)
-            all_ml.append(ml)
+    with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
+        futures = {executor.submit(_process_month, m): m for m in range(1, 13)}
+        for future in as_completed(futures):
+            m = futures[future]
+            try:
+                rev, den, ml = future.result()
+            except Exception as exc:
+                print(f"  [{BATCH_YEAR}-{m:02d}] ERROR: {exc}")
+                rev, den, ml = None, None, None
+            if rev is not None:
+                all_revenue.append(rev)
+                all_density.append(den)
+                all_ml.append(ml)
 
     if not all_revenue:
         print("\n  No data found for this year. Check BATCH_YEAR in .env.")
