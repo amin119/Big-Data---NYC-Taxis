@@ -60,6 +60,13 @@ _weather = {
 }
 _lock = threading.Lock()
 
+# ── Cumulative zone trip totals (accumulates across all micro-batches) ─────────
+# Keyed by zone_id (int). Persists for the lifetime of the streaming job so the
+# heatmap only ever grows brighter — no sawtooth resets at window boundaries.
+_zone_totals: dict = {}
+_zone_totals_lock = threading.Lock()
+RESET_FLAG = "/tmp/zone_reset.flag"
+
 # ── Zone centroids (loaded once at startup from local JSON file) ───────────────
 # zone_id → {"lat": float, "lon": float, "zone_name": str, "borough": str}
 # File is written by scripts/load_zone_centroids.py
@@ -224,7 +231,7 @@ def start_weather_stream(spark):
     return (
         parsed.writeStream
         .foreachBatch(on_batch)
-        .trigger(processingTime="10 seconds")
+        .trigger(processingTime="5 seconds")
         .option("checkpointLocation", f"{CHECKPOINT_DIR}/weather")
         .start()
     )
@@ -299,24 +306,37 @@ def start_trips_stream(spark):
                 f"weather: {wlabel} ×{multiplier} | "
                 f"window: {max(r.window_start for r in rows)}"
             )
-            # Update zone_map_stats for Grafana Geomap (Spark connector, no cassandra-driver)
-            if _centroids:
+            # Accumulate trip counts into the rolling totals dict
+            with _zone_totals_lock:
+                if os.path.exists(RESET_FLAG):
+                    _zone_totals.clear()
+                    os.remove(RESET_FLAG)
+                    print(f"  [trips  epoch {epoch_id}] RESET — zone totals cleared")
+                for r in rows:
+                    zid = int(r.zone_id)
+                    _zone_totals[zid] = _zone_totals.get(zid, 0) + int(r.trip_count)
+                snapshot = dict(_zone_totals)
+
+            # Write ALL known zones (not just those active this batch) so the
+            # heatmap reflects cumulative activity and never shows stale zeros.
+            if _centroids and snapshot:
                 from pyspark.sql import Row
                 now = datetime.now(timezone.utc)
                 map_rows = [
                     Row(
                         snapshot="current",
-                        zone_id=int(r.zone_id),
-                        lat=_centroids[r.zone_id]["lat"],
-                        lon=_centroids[r.zone_id]["lon"],
-                        zone_name=_centroids[r.zone_id]["zone_name"],
-                        borough=_centroids[r.zone_id]["borough"],
-                        trip_count=int(r.trip_count),
-                        predicted_demand=int(r.predicted_demand),
+                        zone_id=zid,
+                        lat=_centroids[zid]["lat"],
+                        lon=_centroids[zid]["lon"],
+                        zone_name=_centroids[zid]["zone_name"],
+                        borough=_centroids[zid]["borough"],
+                        trip_count=total,
+                        predicted_demand=int(total * multiplier),
                         weather_label=wlabel,
                         updated_at=now,
                     )
-                    for r in rows if r.zone_id in _centroids
+                    for zid, total in snapshot.items()
+                    if zid in _centroids
                 ]
                 if map_rows:
                     cass_write(spark.createDataFrame(map_rows), "zone_map_stats")
@@ -326,7 +346,7 @@ def start_trips_stream(spark):
     return (
         windowed.writeStream
         .foreachBatch(on_batch)
-        .trigger(processingTime="30 seconds")
+        .trigger(processingTime="5 seconds")
         .option("checkpointLocation", f"{CHECKPOINT_DIR}/trips")
         .outputMode("update")
         .start()
@@ -341,7 +361,7 @@ def main():
     print(f"  Kafka     : {KAFKA_BROKER}")
     print(f"  Topics    : {TOPIC_TRIPS}  |  {TOPIC_WEATHER}")
     print(f"  Cassandra : {CASSANDRA_HOST}:{CASSANDRA_PORT}/{CASSANDRA_KEYSPACE}")
-    print(f"  Window    : 5 min tumbling  |  Trigger : 30 s")
+    print(f"  Window    : 5 min tumbling  |  Trigger : 5 s")
     print(f"  Checkpoint: {CHECKPOINT_DIR}/")
     print("=" * 60)
 
