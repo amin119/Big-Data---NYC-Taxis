@@ -86,7 +86,7 @@
           "queryType": "query",
           "rawQuery": true,
           "refId": "A",
-          "target": "SELECT zone_id, trip_count, total_revenue, avg_tip FROM taxi_streaming.daily_stats WHERE zone_id=161 LIMIT 12"
+          "target": "SELECT zone_id, trip_count, total_revenue, avg_tip FROM taxi_streaming.daily_stats WHERE zone_id=161 AND date >= '${year}-01-01' AND date <= '${year}-12-31' LIMIT 12"
         }
       ],
       "title": "Zone Stats",
@@ -183,7 +183,7 @@
           "rawQuery": true,
           "refId": "A",
           "table": "daily_stats",
-          "target": "SELECT date, trip_count FROM taxi_streaming.daily_stats WHERE zone_id=161 LIMIT 12"
+          "target": "SELECT date, trip_count FROM taxi_streaming.daily_stats WHERE zone_id=161 AND date >= '${year}-01-01' AND date <= '${year}-12-31' LIMIT 12"
         }
       ],
       "title": "Trip Volume Over Time",
@@ -279,10 +279,10 @@
           "datasourceId": 1,
           "keyspace": "taxi_streaming",
           "queryType": "query",
-          "rawQuery": false,
+          "rawQuery": true,
           "refId": "A",
           "table": "daily_stats",
-          "target": "SELECT date, total_revenue FROM taxi_streaming.daily_stats WHERE zone_id=161 LIMIT 12",
+          "target": "SELECT date, total_revenue FROM taxi_streaming.daily_stats WHERE zone_id=161 AND date >= '${year}-01-01' AND date <= '${year}-12-31' LIMIT 12",
           "valueId": "161"
         }
       ],
