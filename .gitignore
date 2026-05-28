@@ -41,7 +41,6 @@ models/
 data/
 *.parquet
 *.csv
-*.json
 *.avro
 *.orc
 
