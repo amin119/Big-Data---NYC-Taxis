@@ -407,6 +407,310 @@
       ],
       "title": "Active Zones Heatmap",
       "type": "geomap"
+    },
+    {
+      "datasource": {
+        "type": "hadesarchitect-cassandra-datasource",
+        "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Avg Tip ($)",
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineWidth": 1,
+            "scaleDistribution": { "type": "linear" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 80   }
+            ]
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 10,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.7,
+        "fullHighlight": false,
+        "groupWidth": 0.7,
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "orientation": "auto",
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": { "mode": "single", "sort": "none" },
+        "xField": "date",
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "columnTime": "date",
+          "datasource": {
+            "type": "hadesarchitect-cassandra-datasource",
+            "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+          },
+          "datasourceId": 1,
+          "keyspace": "taxi_streaming",
+          "queryType": "query",
+          "rawQuery": true,
+          "refId": "A",
+          "table": "daily_stats",
+          "target": "SELECT date, avg_tip FROM taxi_streaming.daily_stats WHERE zone_id=161 AND date >= '${year}-01-01' AND date <= '${year}-12-31' LIMIT 12"
+        }
+      ],
+      "title": "Avg Tip Per Month — Zone 161",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "hadesarchitect-cassandra-datasource",
+        "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Trips",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 80   }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "total_revenue" },
+            "properties": [
+              { "id": "unit",                   "value": "currencyUSD" },
+              { "id": "custom.axisPlacement",   "value": "right"      },
+              { "id": "custom.axisLabel",       "value": "Revenue ($)"}
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "columnTime": "date",
+          "datasource": {
+            "type": "hadesarchitect-cassandra-datasource",
+            "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+          },
+          "datasourceId": 1,
+          "keyspace": "taxi_streaming",
+          "queryType": "query",
+          "rawQuery": true,
+          "refId": "A",
+          "table": "daily_stats",
+          "target": "SELECT date, trip_count, total_revenue FROM taxi_streaming.daily_stats WHERE zone_id=161 AND date >= '${year}-01-01' AND date <= '${year}-12-31' LIMIT 12"
+        }
+      ],
+      "title": "Revenue vs Trip Volume — Zone 161",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "hadesarchitect-cassandra-datasource",
+        "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [ { "color": "green", "value": null } ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "trip_count" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green",  "value": null  },
+                    { "color": "yellow", "value": 5000  },
+                    { "color": "orange", "value": 15000 },
+                    { "color": "red",    "value": 30000 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "zone_name" },
+            "properties": [ { "id": "custom.width", "value": 200 } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "borough" },
+            "properties": [ { "id": "custom.width", "value": 120 } ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 24 },
+      "id": 12,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [ { "desc": true, "displayName": "trip_count" } ]
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "hadesarchitect-cassandra-datasource",
+            "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+          },
+          "datasourceId": 1,
+          "queryType": "query",
+          "rawQuery": true,
+          "refId": "A",
+          "target": "SELECT zone_name, borough, trip_count FROM taxi_streaming.zone_map_stats WHERE snapshot='batch-${year}' LIMIT 20"
+        }
+      ],
+      "title": "Top Zones by Annual Trips (${year})",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "hadesarchitect-cassandra-datasource",
+        "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [ { "color": "green", "value": null } ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 10, "x": 14, "y": 24 },
+      "id": 13,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "hadesarchitect-cassandra-datasource",
+            "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+          },
+          "datasourceId": 1,
+          "queryType": "query",
+          "rawQuery": true,
+          "refId": "A",
+          "target": "SELECT trip_count FROM taxi_streaming.daily_stats WHERE zone_id=161 AND date >= '${year}-01-01' AND date <= '${year}-12-31' LIMIT 12"
+        }
+      ],
+      "title": "Zone 161 — Annual Trips (${year})",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "hadesarchitect-cassandra-datasource",
+        "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [ { "color": "green", "value": null } ]
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 10, "x": 14, "y": 28 },
+      "id": 14,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "hadesarchitect-cassandra-datasource",
+            "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+          },
+          "datasourceId": 1,
+          "queryType": "query",
+          "rawQuery": true,
+          "refId": "A",
+          "target": "SELECT total_revenue FROM taxi_streaming.daily_stats WHERE zone_id=161 AND date >= '${year}-01-01' AND date <= '${year}-12-31' LIMIT 12"
+        }
+      ],
+      "title": "Zone 161 — Annual Revenue (${year})",
+      "type": "stat"
     }
   ],
   "refresh": "",
