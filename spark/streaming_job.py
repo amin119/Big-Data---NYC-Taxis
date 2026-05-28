@@ -5,17 +5,21 @@ Reads from two Kafka topics:
   taxi-trips   → 5-min tumbling window aggregations per pickup zone
   taxi-weather → in-memory weather state + persisted to Cassandra
 
-Applies a weather-based demand multiplier to each window result,
-then writes everything to Cassandra for Grafana to visualise.
+For every window × zone, computes:
+  - Surge score  0-5  (trip_count vs pre-computed baseline mean)
+  - Z-score           ((trip_count - mean) / std)
+  - Anomaly event     written to anomaly_events when |Z| > 2.5,
+                      classified as WEATHER_DRIVEN / TIME_ANOMALY / UNEXPLAINED
 
 Run (from project root, with .venv active):
   python spark/streaming_job.py
 
-First run downloads ~200 MB of JARs into ~/.ivy2 — subsequent runs are instant.
 Prerequisites:
-  - docker compose up -d  (Kafka + Cassandra must be healthy)
-  - python scripts/producer.py  (must be running in another terminal)
+  - docker compose up -d
   - docker exec -i cassandra cqlsh < cassandra/init.cql  (run once)
+  - python scripts/load_zone_centroids.py                (run once)
+  - python scripts/compute_baseline.py                   (run once)
+  - python scripts/producer.py                           (in another terminal)
 """
 
 import os
@@ -29,7 +33,6 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     from_json, col, window, count, avg,
     sum as spark_sum, when, to_timestamp, lit,
-    round as spark_round,
 )
 from pyspark.sql.types import (
     StructType, StructField,
@@ -47,8 +50,13 @@ CASSANDRA_PORT     = os.getenv("CASSANDRA_PORT",     "9042")
 CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "taxi_streaming")
 CHECKPOINT_DIR     = "checkpoints/streaming"
 
+# Anomaly threshold — |Z| above this fires an anomaly event
+ANOMALY_Z_THRESHOLD = float(os.getenv("ANOMALY_Z_THRESHOLD", "2.5"))
+
+# Rush-hour windows used for TIME_ANOMALY classification (hour of day)
+RUSH_HOURS = {7, 8, 9, 17, 18, 19}
+
 # ── Shared weather state ───────────────────────────────────────────────────────
-# Updated by the weather stream's foreachBatch; read by the trips stream.
 _weather = {
     "temperature_2m": 15.0,
     "precipitation":  0.0,
@@ -57,22 +65,25 @@ _weather = {
     "is_raining":     False,
     "is_cold":        False,
     "weather_label":  "clear_mild",
+    "recorded_at":    None,   # ISO string of last update — used for WEATHER_DRIVEN detection
 }
 _lock = threading.Lock()
 
-# ── Cumulative zone trip totals (accumulates across all micro-batches) ─────────
-# Keyed by zone_id (int). Persists for the lifetime of the streaming job so the
-# heatmap only ever grows brighter — no sawtooth resets at window boundaries.
+# ── Cumulative zone trip totals ────────────────────────────────────────────────
 _zone_totals: dict = {}
-_zone_totals_lock = threading.Lock()
-RESET_FLAG = "/tmp/zone_reset.flag"
+_zone_totals_lock  = threading.Lock()
+RESET_FLAG         = "/tmp/zone_reset.flag"
 
-# ── Zone centroids (loaded once at startup from local JSON file) ───────────────
-# zone_id → {"lat": float, "lon": float, "zone_name": str, "borough": str}
-# File is written by scripts/load_zone_centroids.py
+# ── Zone centroids (loaded once from local JSON) ───────────────────────────────
 _centroids: dict = {}
 CENTROIDS_FILE = "zone_centroids.json"
 
+# ── Baselines dict (loaded once from Cassandra at startup) ────────────────────
+# key: (zone_id, hour, day_of_week, weather_label)  →  (mean, std)
+_baselines: dict = {}
+
+
+# ── Startup loaders ────────────────────────────────────────────────────────────
 
 def load_centroids() -> None:
     global _centroids
@@ -82,8 +93,41 @@ def load_centroids() -> None:
     with open(CENTROIDS_FILE) as f:
         data = json.load(f)
     _centroids = {int(k): v for k, v in data.items()}
-    print(f"  Loaded {len(_centroids)} zone centroids from {CENTROIDS_FILE}")
+    print(f"  Loaded {len(_centroids)} zone centroids")
 
+
+def load_baselines() -> None:
+    """Read zone_baselines from Cassandra into driver-memory dict."""
+    global _baselines
+    try:
+        from cassandra.cluster import Cluster
+        from cassandra.policies import RoundRobinPolicy
+        cluster = Cluster(
+            [CASSANDRA_HOST],
+            port=int(CASSANDRA_PORT),
+            load_balancing_policy=RoundRobinPolicy(),
+            protocol_version=4,
+        )
+        session = cluster.connect(CASSANDRA_KEYSPACE)
+        rows = session.execute(
+            "SELECT zone_id, hour, day_of_week, weather_label, mean_count, std_count "
+            "FROM zone_baselines"
+        )
+        _baselines = {
+            (r.zone_id, r.hour, r.day_of_week, r.weather_label): (r.mean_count, r.std_count)
+            for r in rows
+        }
+        cluster.shutdown()
+        print(f"  Loaded {len(_baselines):,} baseline entries from Cassandra")
+        if not _baselines:
+            print("  WARNING: zone_baselines is empty — run scripts/compute_baseline.py first")
+            print("           Surge scores and Z-scores will be 0 until baselines are loaded.")
+    except Exception as exc:
+        print(f"  WARNING: Could not load baselines ({exc})")
+        print("           Surge / anomaly detection will be inactive this run.")
+
+
+# ── Weather helpers ────────────────────────────────────────────────────────────
 
 def get_weather() -> dict:
     with _lock:
@@ -100,6 +144,7 @@ def update_weather(row) -> None:
             "is_raining":     bool(row.is_raining),
             "is_cold":        bool(row.is_cold),
             "weather_label":  str(row.weather_label     or "clear_mild"),
+            "recorded_at":    str(row.recorded_at       or ""),
         })
 
 
@@ -111,6 +156,39 @@ def demand_multiplier(is_raining: bool, is_cold: bool) -> float:
     if is_cold:
         return 1.1
     return 1.0
+
+
+# ── Surge + Anomaly helpers ────────────────────────────────────────────────────
+
+def surge_score_from_ratio(ratio: float) -> int:
+    """Map demand ratio (current / baseline_mean) to 0-5 surge score."""
+    if ratio < 0.5:   return 0
+    if ratio < 0.8:   return 1
+    if ratio < 1.2:   return 2
+    if ratio < 1.8:   return 3
+    if ratio < 2.5:   return 4
+    return 5
+
+
+def classify_anomaly(hour: int, weather_changed: bool) -> str:
+    """Return anomaly classification string."""
+    if weather_changed:
+        return "WEATHER_DRIVEN"
+    if hour in RUSH_HOURS:
+        return "TIME_ANOMALY"
+    return "UNEXPLAINED"
+
+
+def weather_recently_changed(recorded_at_str: str, window_minutes: int = 15) -> bool:
+    """True if the last weather update arrived within window_minutes ago."""
+    if not recorded_at_str:
+        return False
+    try:
+        updated = datetime.fromisoformat(recorded_at_str.replace("Z", "+00:00"))
+        delta   = (datetime.now(timezone.utc) - updated).total_seconds() / 60
+        return delta <= window_minutes
+    except Exception:
+        return False
 
 
 # ── Kafka message schemas ──────────────────────────────────────────────────────
@@ -166,8 +244,8 @@ def build_spark() -> SparkSession:
         SparkSession.builder
         .appName("NYCTaxiStreaming")
         .master("local[2]")
-        .config("spark.driver.memory",            "2g")
-        .config("spark.sql.shuffle.partitions",   "4")
+        .config("spark.driver.memory",          "2g")
+        .config("spark.sql.shuffle.partitions", "4")
         .config(
             "spark.jars.packages",
             "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
@@ -200,11 +278,7 @@ def start_weather_stream(spark):
         rows = df.collect()
         if not rows:
             return
-
-        # Update in-memory state with the latest message in this micro-batch
         update_weather(rows[-1])
-
-        # Persist to Cassandra for Grafana weather panel
         out = df.select(
             lit("open-meteo").alias("source"),
             to_timestamp(col("recorded_at")).alias("recorded_at"),
@@ -220,13 +294,12 @@ def start_weather_stream(spark):
             cass_write(out, "weather_snapshots")
             w = get_weather()
             print(
-                f"  [weather epoch {epoch_id}] "
-                f"{w['weather_label']} | "
+                f"  [weather {epoch_id}] {w['weather_label']} | "
                 f"{w['temperature_2m']:.1f}°C | "
                 f"rain={w['is_raining']} cold={w['is_cold']}"
             )
         except Exception as exc:
-            print(f"  [weather] Cassandra write error: {exc}")
+            print(f"  [weather] Cassandra error: {exc}")
 
     return (
         parsed.writeStream
@@ -250,7 +323,6 @@ def start_trips_stream(spark):
         .load()
     )
 
-    # Parse JSON and add event_time column for windowing
     parsed = raw.select(
         from_json(col("value").cast("string"), TRIP_SCHEMA).alias("d")
     ).select(
@@ -258,7 +330,6 @@ def start_trips_stream(spark):
         to_timestamp(col("d.ingested_at")).alias("event_time"),
     )
 
-    # 5-minute tumbling window aggregation per pickup zone
     windowed = (
         parsed
         .withWatermark("event_time", "10 minutes")
@@ -280,48 +351,135 @@ def start_trips_stream(spark):
         if df.rdd.isEmpty():
             return
 
-        weather    = get_weather()
-        multiplier = demand_multiplier(weather["is_raining"], weather["is_cold"])
-        wlabel     = weather["weather_label"]
+        weather        = get_weather()
+        multiplier     = demand_multiplier(weather["is_raining"], weather["is_cold"])
+        wlabel         = weather["weather_label"]
+        wx_changed     = weather_recently_changed(weather.get("recorded_at", ""))
 
-        out = df.select(
-            col("zone_id"),
-            col("window.start").alias("window_start"),
-            col("trip_count"),
-            spark_round(col("avg_fare"),     2).alias("avg_fare"),
-            spark_round(col("avg_distance"), 4).alias("avg_distance"),
-            col("anomaly_count"),
-            lit(wlabel).alias("weather_label"),
-            lit(float(multiplier)).alias("multiplier"),
-            (col("trip_count") * lit(multiplier)).cast("int").alias("predicted_demand"),
-        )
+        rows           = df.collect()
+        now            = datetime.now(timezone.utc)
+        anomaly_rows   = []
 
+        # ── Build enriched rows with surge + Z-score ───────────────────────────
+        enriched = []
+        for r in rows:
+            zone_id    = int(r.zone_id)
+            trip_count = int(r.trip_count)
+            win_start  = r["window"]["start"]
+            hour       = win_start.hour if win_start else now.hour
+            dow        = win_start.weekday() if win_start else now.weekday()
+
+            # Baseline lookup
+            key = (zone_id, hour, dow, wlabel)
+            baseline = _baselines.get(key)
+
+            if baseline and baseline[0] > 0:
+                mean, std = baseline
+                z_score    = round((trip_count - mean) / std, 4)
+                ratio      = trip_count / mean
+                s_score    = surge_score_from_ratio(ratio)
+            else:
+                z_score = 0.0
+                s_score = 2   # neutral — no baseline
+
+            enriched.append({
+                "zone_id":        zone_id,
+                "window_start":   win_start,
+                "trip_count":     trip_count,
+                "avg_fare":       round(float(r.avg_fare or 0), 2),
+                "avg_distance":   round(float(r.avg_distance or 0), 4),
+                "anomaly_count":  int(r.anomaly_count or 0),
+                "weather_label":  wlabel,
+                "multiplier":     float(multiplier),
+                "predicted_demand": int(trip_count * multiplier),
+                "surge_score":    s_score,
+                "z_score":        z_score,
+            })
+
+            # ── Anomaly detection ──────────────────────────────────────────────
+            if abs(z_score) > ANOMALY_Z_THRESHOLD and baseline:
+                classification = classify_anomaly(hour, wx_changed)
+                zone_name = _centroids.get(zone_id, {}).get("zone_name", f"Zone {zone_id}")
+                anomaly_rows.append({
+                    "zone_id":        zone_id,
+                    "event_time":     now,
+                    "z_score":        z_score,
+                    "surge_score":    s_score,
+                    "classification": classification,
+                    "trip_count":     trip_count,
+                    "baseline_mean":  round(baseline[0], 2),
+                    "weather_label":  wlabel,
+                    "zone_name":      zone_name,
+                })
+
+        # ── Write trip_stats_by_window ─────────────────────────────────────────
         try:
-            cass_write(out, "trip_stats_by_window")
-            rows = out.collect()
-            n = len(rows)
-            print(
-                f"  [trips  epoch {epoch_id}] "
-                f"{n} zones | "
-                f"weather: {wlabel} ×{multiplier} | "
-                f"window: {max(r.window_start for r in rows)}"
-            )
-            # Accumulate trip counts into the rolling totals dict
-            with _zone_totals_lock:
-                if os.path.exists(RESET_FLAG):
-                    _zone_totals.clear()
-                    os.remove(RESET_FLAG)
-                    print(f"  [trips  epoch {epoch_id}] RESET — zone totals cleared")
-                for r in rows:
-                    zid = int(r.zone_id)
-                    _zone_totals[zid] = _zone_totals.get(zid, 0) + int(r.trip_count)
-                snapshot = dict(_zone_totals)
+            from pyspark.sql import Row
+            stats_rows = [
+                Row(
+                    zone_id=e["zone_id"],
+                    window_start=e["window_start"],
+                    trip_count=e["trip_count"],
+                    avg_fare=e["avg_fare"],
+                    avg_distance=e["avg_distance"],
+                    anomaly_count=e["anomaly_count"],
+                    weather_label=e["weather_label"],
+                    multiplier=e["multiplier"],
+                    predicted_demand=e["predicted_demand"],
+                    surge_score=e["surge_score"],
+                    z_score=e["z_score"],
+                )
+                for e in enriched
+            ]
+            cass_write(spark.createDataFrame(stats_rows), "trip_stats_by_window")
+        except Exception as exc:
+            print(f"  [trips] trip_stats write error: {exc}")
 
-            # Write ALL known zones (not just those active this batch) so the
-            # heatmap reflects cumulative activity and never shows stale zeros.
-            if _centroids and snapshot:
+        # ── Write anomaly_events ───────────────────────────────────────────────
+        if anomaly_rows:
+            try:
                 from pyspark.sql import Row
-                now = datetime.now(timezone.utc)
+                anom_spark_rows = [
+                    Row(
+                        zone_id=a["zone_id"],
+                        event_time=a["event_time"],
+                        z_score=a["z_score"],
+                        surge_score=a["surge_score"],
+                        classification=a["classification"],
+                        trip_count=a["trip_count"],
+                        baseline_mean=a["baseline_mean"],
+                        weather_label=a["weather_label"],
+                        zone_name=a["zone_name"],
+                    )
+                    for a in anomaly_rows
+                ]
+                cass_write(spark.createDataFrame(anom_spark_rows), "anomaly_events")
+                for a in anomaly_rows:
+                    print(
+                        f"  ⚡ ANOMALY zone={a['zone_id']:>3} ({a['zone_name']}) "
+                        f"Z={a['z_score']:+.2f} surge={a['surge_score']} "
+                        f"[{a['classification']}] "
+                        f"count={a['trip_count']} vs baseline={a['baseline_mean']:.1f}"
+                    )
+            except Exception as exc:
+                print(f"  [trips] anomaly_events write error: {exc}")
+
+        # ── Accumulate zone totals + write zone_map_stats ──────────────────────
+        surge_by_zone = {e["zone_id"]: e["surge_score"] for e in enriched}
+
+        with _zone_totals_lock:
+            if os.path.exists(RESET_FLAG):
+                _zone_totals.clear()
+                os.remove(RESET_FLAG)
+                print(f"  [trips {epoch_id}] RESET — zone totals cleared")
+            for e in enriched:
+                zid = e["zone_id"]
+                _zone_totals[zid] = _zone_totals.get(zid, 0) + e["trip_count"]
+            snapshot = dict(_zone_totals)
+
+        if _centroids and snapshot:
+            try:
+                from pyspark.sql import Row
                 map_rows = [
                     Row(
                         snapshot="current",
@@ -333,6 +491,7 @@ def start_trips_stream(spark):
                         trip_count=total,
                         predicted_demand=int(total * multiplier),
                         weather_label=wlabel,
+                        surge_score=surge_by_zone.get(zid, 2),
                         updated_at=now,
                     )
                     for zid, total in snapshot.items()
@@ -340,8 +499,21 @@ def start_trips_stream(spark):
                 ]
                 if map_rows:
                     cass_write(spark.createDataFrame(map_rows), "zone_map_stats")
-        except Exception as exc:
-            print(f"  [trips] Cassandra write error: {exc}")
+            except Exception as exc:
+                print(f"  [trips] zone_map_stats write error: {exc}")
+
+        # ── Console summary ────────────────────────────────────────────────────
+        n_anomalies = len(anomaly_rows)
+        top = sorted(enriched, key=lambda e: e["surge_score"], reverse=True)[:3]
+        top_str = "  ".join(
+            f"z{e['zone_id']}=S{e['surge_score']}" for e in top
+        )
+        print(
+            f"  [trips  {epoch_id}] {len(enriched)} zones | "
+            f"weather: {wlabel} ×{multiplier} | "
+            f"anomalies: {n_anomalies} | "
+            f"top: {top_str}"
+        )
 
     return (
         windowed.writeStream
@@ -361,15 +533,18 @@ def main():
     print(f"  Kafka     : {KAFKA_BROKER}")
     print(f"  Topics    : {TOPIC_TRIPS}  |  {TOPIC_WEATHER}")
     print(f"  Cassandra : {CASSANDRA_HOST}:{CASSANDRA_PORT}/{CASSANDRA_KEYSPACE}")
-    print(f"  Window    : 5 min tumbling  |  Trigger : 5 s")
-    print(f"  Checkpoint: {CHECKPOINT_DIR}/")
+    print(f"  Window    : 5 min tumbling  |  Trigger: 5 s")
+    print(f"  Anomaly Z : >{ANOMALY_Z_THRESHOLD}")
     print("=" * 60)
 
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
-    print("  Loading zone centroids ...")
+    print("\n  Loading zone centroids ...")
     load_centroids()
+
+    print("  Loading baselines from Cassandra ...")
+    load_baselines()
 
     print("  Starting weather stream ...")
     weather_q = start_weather_stream(spark)
@@ -387,83 +562,6 @@ def main():
         weather_q.stop()
         spark.stop()
         print("  Stopped.")
-
-
-def _init_cassandra_schema():
-    """Create keyspace and tables using cassandra-driver if they don't exist."""
-    try:
-        from cassandra.io.asyncioreactor import AsyncioConnection  # must precede Cluster import
-        from cassandra.cluster import Cluster
-        cluster = Cluster([CASSANDRA_HOST], port=int(CASSANDRA_PORT), connection_class=AsyncioConnection)
-        session = cluster.connect()
-
-        session.execute(f"""
-            CREATE KEYSPACE IF NOT EXISTS {CASSANDRA_KEYSPACE}
-            WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}
-        """)
-        session.set_keyspace(CASSANDRA_KEYSPACE)
-
-        session.execute("""
-            CREATE TABLE IF NOT EXISTS trip_stats_by_window (
-                zone_id          int,
-                window_start     timestamp,
-                trip_count       bigint,
-                avg_fare         double,
-                avg_distance     double,
-                anomaly_count    bigint,
-                weather_label    text,
-                multiplier       double,
-                predicted_demand int,
-                PRIMARY KEY ((zone_id), window_start)
-            ) WITH CLUSTERING ORDER BY (window_start DESC)
-        """)
-
-        session.execute("""
-            CREATE TABLE IF NOT EXISTS weather_snapshots (
-                source        text,
-                recorded_at   timestamp,
-                temperature_c double,
-                precipitation double,
-                windspeed     double,
-                weathercode   int,
-                is_raining    boolean,
-                is_cold       boolean,
-                weather_label text,
-                PRIMARY KEY (source, recorded_at)
-            ) WITH CLUSTERING ORDER BY (recorded_at DESC)
-        """)
-
-        session.execute("""
-            CREATE TABLE IF NOT EXISTS daily_stats (
-                zone_id       int,
-                date          date,
-                trip_count    bigint,
-                total_revenue double,
-                avg_tip       double,
-                PRIMARY KEY ((zone_id), date)
-            ) WITH CLUSTERING ORDER BY (date DESC)
-        """)
-
-        session.execute("""
-            CREATE TABLE IF NOT EXISTS zone_map_stats (
-                snapshot         text,
-                zone_id          int,
-                lat              double,
-                lon              double,
-                zone_name        text,
-                borough          text,
-                trip_count       bigint,
-                predicted_demand int,
-                weather_label    text,
-                updated_at       timestamp,
-                PRIMARY KEY (snapshot, zone_id)
-            )
-        """)
-
-        cluster.shutdown()
-    except Exception as exc:
-        print(f"\n  WARNING: Could not auto-init schema ({exc})")
-        print("  Run manually: docker exec -i cassandra cqlsh < cassandra/init.cql")
 
 
 if __name__ == "__main__":

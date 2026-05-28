@@ -75,6 +75,70 @@ def reset_current_snapshot() -> int:
     return len(zone_ids)
 
 
+def fetch_anomalies(zone_id: int = None, limit: int = 20) -> list:
+    from cassandra.cluster import Cluster
+    cluster = Cluster([CASSANDRA_HOST], port=CASSANDRA_PORT)
+    session = cluster.connect(CASSANDRA_KEYSPACE)
+    if zone_id:
+        rows = session.execute(
+            "SELECT zone_id, event_time, z_score, surge_score, classification, "
+            "trip_count, baseline_mean, weather_label, zone_name "
+            "FROM anomaly_events WHERE zone_id=%s LIMIT %s",
+            (zone_id, limit),
+        )
+    else:
+        # Full-table scan — anomaly_events is small (only fired on |Z|>2.5)
+        rows = session.execute(
+            "SELECT zone_id, event_time, z_score, surge_score, classification, "
+            "trip_count, baseline_mean, weather_label, zone_name "
+            "FROM anomaly_events LIMIT %s ALLOW FILTERING",
+            (limit,),
+        )
+    data = [
+        {
+            "zone_id":        r.zone_id,
+            "event_time":     r.event_time.isoformat() if r.event_time else None,
+            "z_score":        round(r.z_score or 0, 2),
+            "surge_score":    r.surge_score or 0,
+            "classification": r.classification or "UNEXPLAINED",
+            "trip_count":     r.trip_count or 0,
+            "baseline_mean":  round(r.baseline_mean or 0, 1),
+            "weather_label":  r.weather_label or "",
+            "zone_name":      r.zone_name or f"Zone {r.zone_id}",
+        }
+        for r in rows
+    ]
+    cluster.shutdown()
+    # Sort by event_time descending (ALLOW FILTERING doesn't guarantee order)
+    data.sort(key=lambda x: x["event_time"] or "", reverse=True)
+    return data[:limit]
+
+
+def fetch_surge() -> list:
+    """Return current surge_score per zone, sorted descending."""
+    from cassandra.cluster import Cluster
+    cluster = Cluster([CASSANDRA_HOST], port=CASSANDRA_PORT)
+    session = cluster.connect(CASSANDRA_KEYSPACE)
+    rows = session.execute(
+        "SELECT zone_id, zone_name, surge_score, trip_count, weather_label "
+        "FROM zone_map_stats WHERE snapshot='current'"
+    )
+    data = [
+        {
+            "zone_id":     r.zone_id,
+            "zone_name":   r.zone_name or f"Zone {r.zone_id}",
+            "surge_score": r.surge_score or 0,
+            "trip_count":  r.trip_count  or 0,
+            "weather_label": r.weather_label or "",
+        }
+        for r in rows
+        if (r.surge_score or 0) > 0
+    ]
+    cluster.shutdown()
+    data.sort(key=lambda x: x["surge_score"], reverse=True)
+    return data
+
+
 def _parse_qs(path: str) -> dict:
     """Extract query string params from a path like /zones/batch?year=2022."""
     if "?" not in path:
@@ -110,6 +174,24 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_error(exc)
                 print(f"  GET /zones ERROR: {exc}")
+        elif path == "/anomalies":
+            try:
+                zone_id = int(params["zone"]) if "zone" in params else None
+                limit   = int(params.get("limit", 20))
+                data    = fetch_anomalies(zone_id=zone_id, limit=limit)
+                self._send_json(data)
+                print(f"  GET /anomalies zone={zone_id} → {len(data)} events served")
+            except Exception as exc:
+                self._send_error(exc)
+                print(f"  GET /anomalies ERROR: {exc}")
+        elif path == "/surge":
+            try:
+                data = fetch_surge()
+                self._send_json(data)
+                print(f"  GET /surge → {len(data)} zones served")
+            except Exception as exc:
+                self._send_error(exc)
+                print(f"  GET /surge ERROR: {exc}")
         else:
             self.send_response(404)
             self.end_headers()
@@ -165,6 +247,8 @@ if __name__ == "__main__":
     print(f"  Cassandra : {CASSANDRA_HOST}:{CASSANDRA_PORT}/{CASSANDRA_KEYSPACE}")
     print(f"  Live      : http://localhost:{PORT}/zones")
     print(f"  Batch     : http://localhost:{PORT}/zones/batch?year=2022")
+    print(f"  Surge     : http://localhost:{PORT}/surge")
+    print(f"  Anomalies : http://localhost:{PORT}/anomalies")
     print(f"  Reset     : POST http://localhost:{PORT}/zones/reset")
     print("=" * 50)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
