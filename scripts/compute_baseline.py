@@ -19,6 +19,8 @@ Prerequisites:
     - R2 must have processed trip files  (run prepare_data.py first)
 """
 
+import gevent.monkey; gevent.monkey.patch_all()  # must be before all other imports for Python 3.12
+
 import os
 import sys
 import math
@@ -48,6 +50,10 @@ CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "taxi_streaming")
 WINDOW_MINUTES = 5       # aggregate window size — must match streaming_job.py
 MIN_SAMPLES    = 3       # minimum windows needed to store a baseline entry
 MIN_STD        = 0.5     # floor for std to avoid division-by-zero in Z-score
+
+# ── Local cache ────────────────────────────────────────────────────────────────
+CACHE_DIR      = os.getenv("BASELINE_CACHE_DIR", ".cache/baseline_parquet")
+BASELINE_CACHE = ".cache/baseline_computed.parquet"
 
 
 # ── R2 helpers ─────────────────────────────────────────────────────────────────
@@ -79,10 +85,16 @@ def list_keys(prefix: str) -> list[str]:
 
 
 def read_parquet(key: str) -> pd.DataFrame:
+    cache_path = os.path.join(CACHE_DIR, key)
+    if os.path.exists(cache_path):
+        return pd.read_parquet(cache_path)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     buf = BytesIO()
     _r2().download_fileobj(R2_BUCKET, key, buf)
     buf.seek(0)
-    return pd.read_parquet(buf)
+    df = pd.read_parquet(buf)
+    df.to_parquet(cache_path, index=False, compression="snappy")
+    return df
 
 
 # ── Compute baselines (chunk-by-chunk to avoid OOM) ───────────────────────────
@@ -311,15 +323,25 @@ def main():
     print(f"  Window     : {WINDOW_MINUTES} min  |  min samples: {MIN_SAMPLES}")
     print("=" * 60)
 
-    print("\n── Loading weather from R2 ──")
-    weather = load_weather()
+    if os.path.exists(BASELINE_CACHE):
+        print(f"\n  Found cached baselines at {BASELINE_CACHE} — skipping R2 download + computation.")
+        print("  Delete this file to force a full recompute.\n")
+        baseline = pd.read_parquet(BASELINE_CACHE)
+        print(f"  Loaded {len(baseline):,} baseline rows from cache.")
+    else:
+        print("\n── Loading weather from R2 ──")
+        weather = load_weather()
 
-    print("\n── Processing trips from R2 (chunk by chunk) ──")
-    all_windows = compute_baselines_chunked(weather)
+        print("\n── Processing trips from R2 (chunk by chunk) ──")
+        all_windows = compute_baselines_chunked(weather)
 
-    print("\n── Computing final baselines ──")
-    baseline = compute_baselines(all_windows)
-    del all_windows
+        print("\n── Computing final baselines ──")
+        baseline = compute_baselines(all_windows)
+        del all_windows
+
+        os.makedirs(os.path.dirname(BASELINE_CACHE), exist_ok=True)
+        baseline.to_parquet(BASELINE_CACHE, index=False, compression="snappy")
+        print(f"  Baseline checkpoint saved → {BASELINE_CACHE}")
 
     print("\n── Writing to Cassandra ──")
     write_to_cassandra(baseline)
