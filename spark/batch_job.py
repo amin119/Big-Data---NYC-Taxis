@@ -97,6 +97,8 @@ def _download_key(key: str) -> pd.DataFrame:
 def _load_r2_month(prefix: str, year: int, month: int) -> pd.DataFrame:
     """Download one month's Parquet file(s) from R2 into a pandas DataFrame."""
     key_prefix = f"{prefix}/year={year}/month={month:02d}/"
+    label = key_prefix.split("/")[0]
+    tag = f"[{year}-{month:02d}][{label}]"
     client = _r2()
     paginator = client.get_paginator("list_objects_v2")
     keys = [
@@ -106,12 +108,17 @@ def _load_r2_month(prefix: str, year: int, month: int) -> pd.DataFrame:
         if obj["Key"].endswith(".parquet")
     ]
     if not keys:
+        print(f"  {tag} no files found", flush=True)
         return pd.DataFrame()
+    print(f"  {tag} downloading {len(keys)} file(s) ...", flush=True)
     if len(keys) == 1:
-        return _download_key(keys[0])
-    with ThreadPoolExecutor(max_workers=min(len(keys), 4)) as ex:
-        dfs = list(ex.map(_download_key, keys))
-    return pd.concat(dfs, ignore_index=True)
+        df = _download_key(keys[0])
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(keys), 4)) as ex:
+            dfs = list(ex.map(_download_key, keys))
+        df = pd.concat(dfs, ignore_index=True)
+    print(f"  {tag} {len(df):,} rows loaded ✓", flush=True)
+    return df
 
 
 def _upload_parquet(df: pd.DataFrame, key: str):
@@ -208,11 +215,13 @@ def _process_month(month_num: int):
     """
     tag = f"[{BATCH_YEAR}-{month_num:02d}]"
 
+    print(f"  {tag} loading trips from R2 ...", flush=True)
     trips = _load_r2_month(R2_PROCESSED, BATCH_YEAR, month_num)
     if trips.empty:
         print(f"  {tag} no trips found — skipping")
         return None, None, None
 
+    print(f"  {tag} loading weather from R2 ...", flush=True)
     weather = _load_r2_month(R2_RAW_WEATHER, BATCH_YEAR, month_num)
 
     # ── Parse timestamps & add features ───────────────────────────────────────
@@ -359,6 +368,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
         futures = {executor.submit(_process_month, m): m for m in range(1, 13)}
+        print(f"  Submitted {len(futures)} months to thread pool (workers={MAX_DOWNLOAD_WORKERS})\n", flush=True)
         for future in as_completed(futures):
             m = futures[future]
             try:
