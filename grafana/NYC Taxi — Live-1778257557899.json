@@ -359,6 +359,316 @@
       ],
       "title": "Fare/Distance Anomalies in zone 161",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "hadesarchitect-cassandra-datasource",
+        "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Surge Level",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "scheme",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "line+area" }
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": { "color": "blue",     "index": 0, "text": "Very Low" },
+                "1": { "color": "green",    "index": 1, "text": "Low"      },
+                "2": { "color": "yellow",   "index": 2, "text": "Normal"   },
+                "3": { "color": "orange",   "index": 3, "text": "High"     },
+                "4": { "color": "red",      "index": 4, "text": "Very High"},
+                "5": { "color": "dark-red", "index": 5, "text": "Extreme"  }
+              },
+              "type": "value"
+            }
+          ],
+          "min": 0,
+          "max": 5,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue",     "value": null },
+              { "color": "green",    "value": 1    },
+              { "color": "yellow",   "value": 2    },
+              { "color": "orange",   "value": 3    },
+              { "color": "red",      "value": 4    },
+              { "color": "dark-red", "value": 5    }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "columnTime": "window_start",
+          "datasource": {
+            "type": "hadesarchitect-cassandra-datasource",
+            "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+          },
+          "datasourceId": 1,
+          "keyspace": "taxi_streaming",
+          "queryType": "query",
+          "rawQuery": true,
+          "refId": "A",
+          "table": "trip_stats_by_window",
+          "target": "SELECT window_start, surge_score FROM taxi_streaming.trip_stats_by_window WHERE zone_id=161 LIMIT 20"
+        }
+      ],
+      "title": "Zone 161 — Surge Score",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "hadesarchitect-cassandra-datasource",
+        "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": true,
+            "axisColorMode": "text",
+            "axisLabel": "Z-Score",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 2.5  }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "columnTime": "window_start",
+          "datasource": {
+            "type": "hadesarchitect-cassandra-datasource",
+            "uid": "c383cdbb-2979-4310-8f60-4adfd40ff8c8"
+          },
+          "datasourceId": 1,
+          "keyspace": "taxi_streaming",
+          "queryType": "query",
+          "rawQuery": true,
+          "refId": "A",
+          "table": "trip_stats_by_window",
+          "target": "SELECT window_start, z_score FROM taxi_streaming.trip_stats_by_window WHERE zone_id=161 LIMIT 20"
+        }
+      ],
+      "title": "Zone 161 — Z-Score (anomaly threshold ±2.5)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "c42938c6-680b-4c31-871b-8c0487c9705f"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "color-background" },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 2    },
+              { "color": "orange", "value": 3    },
+              { "color": "red",    "value": 4    }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "zone_name" },
+            "properties": [ { "id": "custom.width", "value": 200 } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "surge_score" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              { "id": "custom.width", "value": 120 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 12,
+      "interval": "10",
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [ { "desc": true, "displayName": "surge_score" } ]
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "columns": [],
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "c42938c6-680b-4c31-871b-8c0487c9705f"
+          },
+          "filters": [],
+          "format": "table",
+          "global_query_id": "",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "",
+          "source": "url",
+          "type": "json",
+          "url": "http://zone-api:5001/surge",
+          "url_options": { "data": "", "method": "GET" }
+        }
+      ],
+      "title": "Top Surge Zones (live)",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "c42938c6-680b-4c31-871b-8c0487c9705f"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 80   }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "z_score" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "yellow", "value": null },
+                    { "color": "red",    "value": 3    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "classification" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "WEATHER_DRIVEN": { "color": "blue",   "index": 0 },
+                      "TIME_ANOMALY":   { "color": "orange", "index": 1 },
+                      "UNEXPLAINED":    { "color": "red",    "index": 2 }
+                    },
+                    "type": "value"
+                  }
+                ]
+              },
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 13,
+      "interval": "10",
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "pluginVersion": "10.2.0",
+      "targets": [
+        {
+          "columns": [],
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "c42938c6-680b-4c31-871b-8c0487c9705f"
+          },
+          "filters": [],
+          "format": "table",
+          "global_query_id": "",
+          "parser": "backend",
+          "refId": "A",
+          "root_selector": "",
+          "source": "url",
+          "type": "json",
+          "url": "http://zone-api:5001/anomalies?limit=20",
+          "url_options": { "data": "", "method": "GET" }
+        }
+      ],
+      "title": "Recent Anomaly Events",
+      "type": "table"
     }
   ],
   "refresh": "5s",
