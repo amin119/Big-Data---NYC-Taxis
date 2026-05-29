@@ -540,7 +540,21 @@ def main():
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
-    print("\n  Loading zone centroids ...")
+    print("\n  Resetting live zone state ...")
+    try:
+        import urllib.request
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"http://{os.getenv('ZONE_API_HOST', 'localhost')}:{os.getenv('ZONE_API_PORT', '5001')}/zones/reset",
+                method="POST",
+            ),
+            timeout=5,
+        )
+        print("  Live zone state reset ✓")
+    except Exception as exc:
+        print(f"  WARNING: Could not reset live state ({exc}) — dashboard may show stale data")
+
+    print("  Loading zone centroids ...")
     load_centroids()
 
     print("  Loading baselines from Cassandra ...")
